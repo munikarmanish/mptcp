@@ -258,6 +258,7 @@ protected: // protected methods
   uint32_t GetRandom(uint32_t, uint32_t);
   double drand();
   uint32_t GetEstSubflows();
+  double calculateSummation(); // Xuan added: calculate the summation value for semicoupled algorithm
 
 protected: // protected variables
 

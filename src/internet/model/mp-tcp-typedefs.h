@@ -42,7 +42,8 @@ typedef enum
   UNCOUPLED,              // 5
   COUPLED_EPSILON,        // 6
   COUPLED_INC,            // 7
-  COUPLED_FULLY           // 8
+  COUPLED_FULLY,          // 8
+  Semi_Coupled            // 9
 } CongestionCtrl_t;
 
 typedef enum

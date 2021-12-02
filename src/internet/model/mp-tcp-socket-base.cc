@@ -66,7 +66,9 @@ MpTcpSocketBase::GetTypeId(void)
                           COUPLED_EPSILON,  "COUPLED_EPSILON",
                           COUPLED_SCALABLE_TCP, "COUPLED_SCALABLE_TCP",
                           COUPLED_FULLY, "COUPLED_FULLY",
-                          UNCOUPLED, "UNCOUPLED"))
+                          UNCOUPLED, "UNCOUPLED",
+                          Semi_Coupled,     "Semi_Coupled"	//Xuan: Added algorithm
+))
 
       .AddAttribute("SchedulingAlgorithm",
                     "Algorithm for data distribution between sub-flows",
@@ -1864,12 +1866,12 @@ MpTcpSocketBase::ReduceCWND(uint8_t sFlowIdx, DSNMapping* ptrDSN)
     break;
 
   case COUPLED_SCALABLE_TCP:
-      d = (int) sFlow->cwnd.Get() - (compute_total_window() >> 3);
-      if (d < 0)
-        d = 0;
-      sFlow->ssthresh = max(2 * mss, (uint32_t) d);
-      sFlow->cwnd = sFlow->ssthresh + 3 * mss;
-      break;
+    d = (int) sFlow->cwnd.Get() - (compute_total_window() >> 3);
+    if (d < 0)
+      d = 0;
+    sFlow->ssthresh = max(2 * mss, (uint32_t) d);
+    sFlow->cwnd = sFlow->ssthresh + 3 * mss;
+    break;
 
   case COUPLED_FULLY:
     d = (int) sFlow->cwnd.Get() - compute_total_window() / B;
@@ -1887,10 +1889,17 @@ MpTcpSocketBase::ReduceCWND(uint8_t sFlowIdx, DSNMapping* ptrDSN)
     sFlow->cwnd = sFlow->ssthresh + 3 * mss;
     break;
 
+  case Semi_Coupled:
+    //Xuan todo: decreasing part for semicoupled algorithm.
+    d = sFlow->cwnd.Get() >> 1;
+    sFlow->ssthresh = max(2 * mss, (uint32_t)d);
+    sFlow->cwnd = sFlow->ssthresh + 3 * mss;
+    break;
+
   default:
     NS_ASSERT(3!=3);
     break;
-    }
+  }
   // update
   sFlow->m_recover = SequenceNumber32(sFlow->maxSeqNb + 1);
   sFlow->m_inFastRec = true;
@@ -2726,6 +2735,7 @@ MpTcpSocketBase::DupAck(uint8_t sFlowIdx, DSNMapping* ptrDSN)
   COUPLED_EPSILON,        // 6
   COUPLED_INC,            // 7
   COUPLED_FULLY           // 8
+  Semi_Coupled            // 9    Xuan added
  */
 std::string
 MpTcpSocketBase::PrintCC(uint32_t cc)
@@ -2758,6 +2768,9 @@ MpTcpSocketBase::PrintCC(uint32_t cc)
     break;
   case 8:
     return "CF";             //8
+    break;
+  case 9:   //Xuan added
+    return "Semi_Coupled";   //9
     break;
   default:
     exit(200);
@@ -3737,13 +3750,14 @@ MpTcpSocketBase::window_changed()
 void
 MpTcpSocketBase::OpenCWND(uint8_t sFlowIdx, uint32_t ackedBytes)
 {
-  NS_LOG_FUNCTION(this << (int) sFlowIdx << ackedBytes);
+  NS_LOG_FUNCTION(this << (int)sFlowIdx << ackedBytes);
   Ptr<MpTcpSubFlow> sFlow = subflows[sFlowIdx];
 
   double adder = 0;
   uint32_t cwnd = sFlow->cwnd.Get();
   uint32_t ssthresh = sFlow->ssthresh;
   uint32_t mss = sFlow->MSS;
+  double rtt, sm = 0; // Xuan added variable for summation
 
   // params used only for COUPLED_INC and COUPLED_EPS only
   int tcp_inc, tt;
@@ -3751,152 +3765,160 @@ MpTcpSocketBase::OpenCWND(uint8_t sFlowIdx, uint32_t ackedBytes)
   double tmp_float;
 
   if (AlgoCC >= COUPLED_SCALABLE_TCP)
+  {
+    if (ackedBytes > mss)
+      ackedBytes = mss;
+    if (ackedBytes < 0)
     {
-      if (ackedBytes > mss)
-        ackedBytes = mss;
-      if (ackedBytes < 0)
-        {
-          exit(200);
-          return;
-        }
-      tcp_inc = (ackedBytes * mss) / cwnd;
-      tt = (ackedBytes * mss) % cwnd;
-      if (m_alphaPerAck)
-        {
-          a = compute_a_scaled(); // Per ACK for COUPLED_INC
-          alpha = compute_alfa(); // Per ACK for COUPLED_EPSILON
-        }
+      exit(200);
+      return;
     }
+    tcp_inc = (ackedBytes * mss) / cwnd;
+    tt = (ackedBytes * mss) % cwnd;
+    if (m_alphaPerAck)
+    {
+      a = compute_a_scaled(); // Per ACK for COUPLED_INC
+      alpha = compute_alfa(); // Per ACK for COUPLED_EPSILON
+    }
+  }
 
   calculateTotalCWND();
   if (cwnd < ssthresh)
+  {
+    sFlow->cwnd += sFlow->MSS;
+#ifdef PLOT
+    sFlow->ssthreshtrack.push_back(make_pair(Simulator::Now().GetSeconds(), sFlow->ssthresh));
+    sFlow->CWNDtrack.push_back(make_pair(Simulator::Now().GetSeconds(), sFlow->cwnd));
+    totalCWNDtrack.push_back(make_pair(Simulator::Now().GetSeconds(), totalCwnd));
+    sFlow->_ss.push_back(make_pair(Simulator::Now().GetSeconds(), TimeScale));
+#endif
+    NS_LOG_WARN("Congestion Control (Slow Start) increment by one segmentSize");
+  }
+  else
+  {
+    switch (AlgoCC)
     {
-      sFlow->cwnd += sFlow->MSS;
+    case RTT_Compensator:
+      calculateAlpha(); // Calculate alpha per drop or RTT...RFC 6356 (Section 4.1)
+      adder = std::min(alpha * sFlow->MSS * sFlow->MSS / totalCwnd, static_cast<double>(sFlow->MSS * sFlow->MSS) / cwnd);
+      adder = std::max(1.0, adder);
+      sFlow->cwnd += static_cast<double>(adder);
 #ifdef PLOT
       sFlow->ssthreshtrack.push_back(make_pair(Simulator::Now().GetSeconds(), sFlow->ssthresh));
       sFlow->CWNDtrack.push_back(make_pair(Simulator::Now().GetSeconds(), sFlow->cwnd));
       totalCWNDtrack.push_back(make_pair(Simulator::Now().GetSeconds(), totalCwnd));
-      sFlow->_ss.push_back(make_pair(Simulator::Now().GetSeconds(), TimeScale));
 #endif
-      NS_LOG_WARN ("Congestion Control (Slow Start) increment by one segmentSize");
+      NS_LOG_ERROR("Congestion Control (RTT_Compensator): alpha " << alpha << " ackedBytes (" << ackedBytes << ") totalCwnd (" << totalCwnd / sFlow->MSS << " packets) -> increment is " << adder << " cwnd: " << sFlow->cwnd);
+      break;
+    case Linked_Increases:
+      calculateAlpha();
+      adder = alpha * sFlow->MSS * sFlow->MSS / totalCwnd;
+      adder = std::max(1.0, adder);
+      sFlow->cwnd += static_cast<double>(adder);
+#ifdef PLOT
+      sFlow->ssthreshtrack.push_back(make_pair(Simulator::Now().GetSeconds(), sFlow->ssthresh));
+      sFlow->CWNDtrack.push_back(make_pair(Simulator::Now().GetSeconds(), sFlow->cwnd));
+      totalCWNDtrack.push_back(make_pair(Simulator::Now().GetSeconds(), totalCwnd));
+#endif
+      NS_LOG_ERROR("Subflow " << (int)sFlowIdx << " Congestion Control (Linked_Increases): alpha " << alpha << " increment is " << adder << " ssthresh " << ssthresh << " cwnd " << cwnd);
+      break;
+    case Uncoupled_TCPs:
+      adder = static_cast<double>(sFlow->MSS * sFlow->MSS) / cwnd;
+      adder = std::max(1.0, adder);
+      sFlow->cwnd += static_cast<double>(adder);
+#ifdef PLOT
+      sFlow->ssthreshtrack.push_back(make_pair(Simulator::Now().GetSeconds(), sFlow->ssthresh));
+      sFlow->CWNDtrack.push_back(make_pair(Simulator::Now().GetSeconds(), sFlow->cwnd));
+      totalCWNDtrack.push_back(make_pair(Simulator::Now().GetSeconds(), totalCwnd));
+#endif
+      NS_LOG_WARN("Subflow " << (int)sFlowIdx << " Congestion Control (Uncoupled_TCPs) increment is " << adder << " ssthresh " << ssthresh << " cwnd " << cwnd);
+      break;
+    case UNCOUPLED:
+      sFlow->cwnd += tcp_inc;
+      break;
+    case Fully_Coupled:
+      adder = static_cast<double>(sFlow->MSS * sFlow->MSS) / totalCwnd;
+      adder = std::max(1.0, adder);
+      sFlow->cwnd += static_cast<double>(adder);
+#ifdef PLOT
+      sFlow->ssthreshtrack.push_back(make_pair(Simulator::Now().GetSeconds(), sFlow->ssthresh));
+      sFlow->CWNDtrack.push_back(make_pair(Simulator::Now().GetSeconds(), sFlow->cwnd));
+      totalCWNDtrack.push_back(make_pair(Simulator::Now().GetSeconds(), totalCwnd));
+#endif
+      NS_LOG_ERROR("Subflow " << (int)sFlowIdx << " Congestion Control (Fully_Coupled) increment is " << adder << " ssthresh " << ssthresh << " cwnd " << cwnd);
+      break;
+
+    case COUPLED_INC:
+      total_cwnd = compute_total_window();
+      tmp2 = (ackedBytes * mss * a) / total_cwnd;
+
+      tmp = tmp2 / A_SCALE;
+
+      if (tmp < 0)
+      {
+        printf("Negative increase!");
+        tmp = 0;
+      }
+
+      if (rand() % A_SCALE < tmp2 % A_SCALE)
+        tmp++;
+
+      if (tmp > tcp_inc) // capping
+        tmp = tcp_inc;
+
+      if ((cwnd + tmp) / mss != cwnd / mss)
+        a = compute_a_scaled();
+
+      sFlow->cwnd = cwnd + tmp;
+      break;
+
+    case COUPLED_EPSILON: // RTT_Compensator
+      total_cwnd = compute_total_window();
+      tmp_float = ((double)ackedBytes * mss * alpha * pow(alpha * cwnd, 1 - _e)) / pow(total_cwnd, 2 - _e);
+      tmp = (int)floor(tmp_float);
+
+      if (drand() < tmp_float - tmp)
+        tmp++;
+
+      if (tmp > tcp_inc) // capping
+        tmp = tcp_inc;
+
+      if ((cwnd + tmp) / mss != cwnd / mss)
+      {
+        if (_e > 0 && _e < 2)
+          alpha = compute_alfa();
+      }
+
+      sFlow->cwnd = cwnd + tmp;
+      break;
+      //
+    case COUPLED_SCALABLE_TCP:
+      sFlow->cwnd = cwnd + ackedBytes * 0.01;
+      break;
+
+    case COUPLED_FULLY:
+      total_cwnd = compute_total_window();
+      tt = (int)(ackedBytes * mss * A);
+      tmp = tt / total_cwnd;
+      if (tmp > tcp_inc)
+        tmp = tcp_inc;
+      sFlow->cwnd = cwnd + tmp;
+      break;
+    case Semi_Coupled:
+      sm = calculateSummation();
+      // Xuan todo: CAP window increase
+      rtt = sFlow->rtt->GetCurrentEstimate().GetSeconds();
+      tmp = (double)cwnd / (rtt * sm);
+      sFlow->cwnd = cwnd + tmp;
+      break;
+
+    default:
+      break;
     }
-  else
-    {
-      switch (AlgoCC)
-        {
-      case RTT_Compensator:
-        calculateAlpha(); // Calculate alpha per drop or RTT...RFC 6356 (Section 4.1)
-        adder = std::min(alpha * sFlow->MSS * sFlow->MSS / totalCwnd, static_cast<double>(sFlow->MSS * sFlow->MSS) / cwnd);
-        adder = std::max(1.0, adder);
-        sFlow->cwnd += static_cast<double>(adder);
 #ifdef PLOT
-        sFlow->ssthreshtrack.push_back(make_pair(Simulator::Now().GetSeconds(), sFlow->ssthresh));
-        sFlow->CWNDtrack.push_back(make_pair(Simulator::Now().GetSeconds(), sFlow->cwnd));
-        totalCWNDtrack.push_back(make_pair(Simulator::Now().GetSeconds(), totalCwnd));
+    sFlow->_ca.push_back(make_pair(Simulator::Now().GetSeconds(), TimeScale));
 #endif
-        NS_LOG_ERROR ("Congestion Control (RTT_Compensator): alpha "<<alpha<<" ackedBytes (" << ackedBytes << ") totalCwnd ("<< totalCwnd / sFlow->MSS<<" packets) -> increment is "<<adder << " cwnd: " << sFlow->cwnd);
-        break;
-      case Linked_Increases:
-        calculateAlpha();
-        adder = alpha * sFlow->MSS * sFlow->MSS / totalCwnd;
-        adder = std::max(1.0, adder);
-        sFlow->cwnd += static_cast<double>(adder);
-#ifdef PLOT
-        sFlow->ssthreshtrack.push_back(make_pair(Simulator::Now().GetSeconds(), sFlow->ssthresh));
-        sFlow->CWNDtrack.push_back(make_pair(Simulator::Now().GetSeconds(), sFlow->cwnd));
-        totalCWNDtrack.push_back(make_pair(Simulator::Now().GetSeconds(), totalCwnd));
-#endif
-        NS_LOG_ERROR ("Subflow "<<(int)sFlowIdx<<" Congestion Control (Linked_Increases): alpha "<<alpha<<" increment is "<<adder<<" ssthresh "<< ssthresh << " cwnd "<<cwnd );
-        break;
-      case Uncoupled_TCPs:
-        adder = static_cast<double>(sFlow->MSS * sFlow->MSS) / cwnd;
-        adder = std::max(1.0, adder);
-        sFlow->cwnd += static_cast<double>(adder);
-#ifdef PLOT
-        sFlow->ssthreshtrack.push_back(make_pair(Simulator::Now().GetSeconds(), sFlow->ssthresh));
-        sFlow->CWNDtrack.push_back(make_pair(Simulator::Now().GetSeconds(), sFlow->cwnd));
-        totalCWNDtrack.push_back(make_pair(Simulator::Now().GetSeconds(), totalCwnd));
-#endif
-        NS_LOG_WARN ("Subflow "<<(int)sFlowIdx<<" Congestion Control (Uncoupled_TCPs) increment is "<<adder<<" ssthresh "<< ssthresh << " cwnd "<<cwnd);
-        break;
-      case UNCOUPLED:
-        sFlow->cwnd += tcp_inc;
-        break;
-      case Fully_Coupled:
-        adder = static_cast<double>(sFlow->MSS * sFlow->MSS) / totalCwnd;
-        adder = std::max(1.0, adder);
-        sFlow->cwnd += static_cast<double>(adder);
-#ifdef PLOT
-        sFlow->ssthreshtrack.push_back(make_pair(Simulator::Now().GetSeconds(), sFlow->ssthresh));
-        sFlow->CWNDtrack.push_back(make_pair(Simulator::Now().GetSeconds(), sFlow->cwnd));
-        totalCWNDtrack.push_back(make_pair(Simulator::Now().GetSeconds(), totalCwnd));
-#endif
-        NS_LOG_ERROR ("Subflow "<<(int)sFlowIdx<<" Congestion Control (Fully_Coupled) increment is "<<adder<<" ssthresh "<< ssthresh << " cwnd "<<cwnd);
-        break;
-
-      case COUPLED_INC:
-        total_cwnd = compute_total_window();
-        tmp2 = (ackedBytes * mss * a) / total_cwnd;
-
-        tmp = tmp2 / A_SCALE;
-
-        if (tmp < 0)
-          {
-            printf("Negative increase!");
-            tmp = 0;
-          }
-
-        if (rand() % A_SCALE < tmp2 % A_SCALE)
-          tmp++;
-
-        if (tmp > tcp_inc)    //capping
-          tmp = tcp_inc;
-
-        if ((cwnd + tmp) / mss != cwnd / mss)
-          a = compute_a_scaled();
-
-        sFlow->cwnd = cwnd + tmp;
-        break;
-
-      case COUPLED_EPSILON: // RTT_Compensator
-        total_cwnd = compute_total_window();
-        tmp_float = ((double) ackedBytes * mss * alpha * pow(alpha * cwnd, 1 - _e)) / pow(total_cwnd, 2 - _e);
-        tmp = (int) floor(tmp_float);
-
-        if (drand() < tmp_float - tmp)
-          tmp++;
-
-        if (tmp > tcp_inc)    //capping
-          tmp = tcp_inc;
-
-        if ((cwnd + tmp) / mss != cwnd / mss)
-          {
-            if (_e > 0 && _e < 2)
-              alpha = compute_alfa();
-          }
-
-        sFlow->cwnd = cwnd + tmp;
-        break;
-        //
-      case COUPLED_SCALABLE_TCP:
-        sFlow->cwnd = cwnd + ackedBytes * 0.01;
-        break;
-
-      case COUPLED_FULLY:
-          total_cwnd = compute_total_window();
-          tt = (int) (ackedBytes * mss * A);
-          tmp = tt / total_cwnd;
-          if (tmp > tcp_inc)
-            tmp = tcp_inc;
-          sFlow->cwnd = cwnd + tmp;
-          break;
-      default:
-        break;
-        }
-#ifdef PLOT
-      sFlow->_ca.push_back(make_pair(Simulator::Now().GetSeconds(), TimeScale));
-#endif
-    }
+  }
 }
 
 void
@@ -4208,4 +4230,24 @@ MpTcpSocketBase::GetEstSubflows()
   return c;
 }
 
-}//namespace ns3
+double
+MpTcpSocketBase::calculateSummation() // Xuan added: calculate the summation value for semicoupled algorithm
+{
+  NS_LOG_FUNCTION_NOARGS();
+  double sumi = 0, rtt, x;
+  Time time;
+  Ptr<MpTcpSubFlow> sFlow;
+
+  for (uint32_t i = 0; i < subflows.size(); i++)
+  {
+    sFlow = subflows[i];
+    time = sFlow->rtt->GetCurrentEstimate();
+    rtt = time.GetSeconds();
+    x = sFlow->cwnd.Get() / rtt;
+    sumi += x;
+  }
+
+  return sumi;
+}
+
+} // namespace ns3
